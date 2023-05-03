@@ -96,15 +96,33 @@ def split_transform_deploy_mod(
 def transform_params(
     mod_transform: tvm.IRModule, model_params: List[tvm.nd.NDArray]
 ) -> List[tvm.nd.NDArray]:
+    from tvm.contrib import tvmjs
     transform_func_name = None
     for gv, func in mod_transform.functions.items():
         if isinstance(func, relax.Function):
             transform_func_name = gv.name_hint
     assert transform_func_name is not None
-
-    ex = relax.build(mod_transform, target="llvm")
-    vm = relax.vm.VirtualMachine(ex, tvm.cpu())
-    res = vm[transform_func_name](model_params)
+    @tvm.register_func("get_item")
+    def get_item(i):
+        gpu_input = tvm.nd.array(model_params[i], device=tvm.cuda())
+        return gpu_input
+    
+    @tvm.register_func("memory_free")
+    def free_input(input):
+        input.__del__()
+    
+    res = []
+    @tvm.register_func("set_item")
+    def set_item(i, value):
+        if len(res)<=i:
+            res.extend([None]*(i-len(res)+1))
+        res[i]=tvm.nd.array(value, device=tvm.cpu())
+        print("set item", i, value.shape)
+    with tvm.target.Target("cuda"):
+        mod_transform = tvm.tir.transform.DefaultGPUSchedule()(mod_transform)
+    ex = relax.build(mod_transform, target="cuda")
+    vm = relax.vm.VirtualMachine(ex, tvm.cuda())
+    vm[transform_func_name]()
     return res
 
 
