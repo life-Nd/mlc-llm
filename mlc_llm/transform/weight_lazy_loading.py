@@ -12,7 +12,7 @@ class ForwardCollector(PyExprVisitor):
         self.out_tuple_map = {}
         self.out_tuple_var = tuple_var
         self.input_params = input_params
-        self.input_params_after_get_item = []
+        self.var_tuple_get_item = []
         self.is_tuple_get_item_input = False
 
     def visit_tuple_getitem_(self, op: relax.TupleGetItem) -> None:
@@ -31,18 +31,8 @@ class ForwardCollector(PyExprVisitor):
             self.is_tuple_get_item_input = False
             super().visit_var_binding_(binding)
             if self.is_tuple_get_item_input:
-                self.input_params_after_get_item.append(binding.var)
-    
-    
-    
-    @staticmethod 
-    def collect_out_tuple_map(tuple_var: relax.Var, func: relax.Function) -> dict:
-        collector = ForwardCollector(tuple_var)
-        collector.visit_expr(func)
-        return collector.out_tuple_map
+                self.var_tuple_get_item.append(binding.var)
 
-    
-    
     
 @visitor
 class LivenessAnalysis(PyExprVisitor):
@@ -74,13 +64,15 @@ class LivenessAnalysis(PyExprVisitor):
         
     
 @mutator
-class LazyLoadingMutator(PyExprMutator):
+class WeightLazyLoadingMutator(PyExprMutator):
     def __init__(self, mod: IRModule = None) -> None:
         super().__init__(mod)
         self.mod=mod
         self.get_item = None
         self.set_item = None
+        # the only input param, which should be a Tuple
         self.input_tuple_param = None
+        # map from out var to index
         self.out_tuple_map = None
         self.out_tuple_var = None
         self.memory_free_insertion = None
@@ -89,18 +81,22 @@ class LazyLoadingMutator(PyExprMutator):
         self.input_tuple_param = func.params[0]
         seq_expr = func.body
         self.out_tuple_var = seq_expr.body
-        
+        # Step 1. collect out_tuple_map and input_params_set
         forward_collector = ForwardCollector(self.out_tuple_var, self.input_tuple_param)
         forward_collector.visit_expr(func)
         self.out_tuple_map = forward_collector.out_tuple_map
-        input_params_set = set(forward_collector.input_params_after_get_item)
+        # input_params_set is the set of binding var for var = params[i]
+        input_params_set = set(forward_collector.var_tuple_get_item)
+        # Step 2. liveness analysis and get where to insert kill_object instruction
         liveness = LivenessAnalysis(self.out_tuple_var, input_params_set)
         liveness.visit_expr(func)
         self.memory_free_insertion=liveness.var_liveness_end
+        #Step 3. rewrite get item and set item
         new_body = self.visit_expr(func.body)
         return relax.Function([], new_body, relax.ObjectStructInfo(), func.attrs)
                 
     def visit_tuple_getitem_(self, tuple_get_item: relax.TupleGetItem) -> relax.Expr:
+        # rewrite get item
         tuple_get_item = super().visit_tuple_getitem_(tuple_get_item)
         if tuple_get_item.tuple_value == self.input_tuple_param:
             return relax.Call(relax.ExternFunc("get_item"), [relax.PrimValue(tuple_get_item.index)], None, [relax.ObjectStructInfo()])
@@ -112,6 +108,7 @@ class LazyLoadingMutator(PyExprMutator):
             index = self.out_tuple_map[binding.var]
             value = self.visit_expr(binding.value)
             var_before_setitem = self.builder_.emit(value)
+            # rewrite set item
             new_var = self.builder_.emit(relax.Call(relax.ExternFunc("set_item"), [index, var_before_setitem], None, [relax.ObjectStructInfo()]))
             self.set_var_remap(binding.var.vid, new_var)
         else:
@@ -121,18 +118,18 @@ class LazyLoadingMutator(PyExprMutator):
                 #handle param[i] in output 
                 if var == binding.var:
                     assert binding.var in self.out_tuple_map
-                    self.builder_.emit(relax.Call(relax.ExternFunc("memory_free"), [var_before_setitem], None, [relax.ObjectStructInfo()]))
+                    self.builder_.emit(relax.op.vm.kill_object(var_before_setitem))
                 else:
-                    self.builder_.emit(relax.Call(relax.ExternFunc("memory_free"), [self.get_var_remap(var.vid)], None, [relax.ObjectStructInfo()]))
+                    self.builder_.emit(relax.op.vm.kill_object(self.get_var_remap(var.vid)))
     
 
-@tvm.transform.module_pass(opt_level=0, name="LazyLoading")
-class LazyLoading:
+@tvm.transform.module_pass(opt_level=0, name="WeightLazyLoading")
+class WeightLazyLoading:
     def transform_module(
         self, mod: IRModule, ctx: tvm.transform.PassContext
     ) -> IRModule:
         
-        mutator = LazyLoadingMutator(mod)
+        mutator = WeightLazyLoadingMutator(mod)
         for gv in mod.functions:
             if gv.name_hint.endswith("transform_params"):
                 func = mod[gv]

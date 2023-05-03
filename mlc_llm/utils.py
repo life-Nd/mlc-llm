@@ -107,17 +107,13 @@ def transform_params(
         gpu_input = tvm.nd.array(model_params[i], device=tvm.cuda())
         return gpu_input
     
-    @tvm.register_func("memory_free")
-    def free_input(input):
-        input.__del__()
-    
     res = []
     @tvm.register_func("set_item")
     def set_item(i, value):
         if len(res)<=i:
-            res.extend([None]*(i-len(res)+1))
+            res.extend([None for _ in range(i-len(res)+1)])
         res[i]=tvm.nd.array(value, device=tvm.cpu())
-        print("set item", i, value.shape)
+        return tvm.nd.empty((1,), device=tvm.cuda())
     with tvm.target.Target("cuda"):
         mod_transform = tvm.tir.transform.DefaultGPUSchedule()(mod_transform)
     ex = relax.build(mod_transform, target="cuda")
@@ -128,7 +124,6 @@ def transform_params(
 
 def save_params(params: List[tvm.nd.NDArray], artifact_path: str) -> None:
     from tvm.contrib import tvmjs  # pylint: disable=import-outside-toplevel
-
     meta_data = {}
     param_dict = {}
     meta_data["ParamSize"] = len(params)
