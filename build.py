@@ -216,7 +216,7 @@ def mod_transform_before_build(
     mod_transform = mlc_llm.transform.WeightLazyLoading()(mod_transform)
     debug_dump_script(mod_transform, "mod_lift_params.py", args)
 
-    new_params = utils.transform_params(mod_transform, model_params)
+    new_params = utils.transform_params(mod_transform, model_params, args.target)
     utils.save_params(new_params, args.artifact_path)
     return mod_deploy
 
